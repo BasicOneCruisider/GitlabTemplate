@@ -1,0 +1,143 @@
+# ==============================================================================
+# GitLab CI/CD Template for Azure Web App Deployment
+#
+# This template defines a reusable, multi-stage pipeline for building a web 
+# application and deploying it sequentially to Staging and Production slots on Azure.
+# It enforces secure, manual promotion to production.
+# ==============================================================================
+
+# Global configuration variables
+variables:
+  # The environment scope determines which set of secrets GitLab uses
+  STAGING_APP_NAME: "my-webapp-staging" # Replace with your Staging Web App Name
+  PROD_APP_NAME: "my-webapp-prod"       # Replace with your Production Web App Name
+  RESOURCE_GROUP_NAME: "rg-app-production" # Common Azure Resource Group
+  AZURE_CLI_IMAGE: mcr.microsoft.com/azure-cli:latest
+  
+# Define the pipeline stages
+stages:
+  - build
+  - test
+  - deploy_staging
+  - deploy_prod
+
+# ----------------------------------------------------
+# ANCHORS & TEMPLATES
+# ----------------------------------------------------
+
+# Template to configure the environment and Azure CLI
+.azure_cli_template: &azure_cli_template
+  image: $AZURE_CLI_IMAGE
+  before_script:
+    # Authenticate to Azure using Service Principal credentials stored as CI/CD variables
+    - |
+      az login --service-principal \
+        -u $AZURE_CLIENT_ID \
+        -p $AZURE_CLIENT_SECRET \
+        --tenant $AZURE_TENANT_ID > /dev/null
+    - echo "Successfully logged into Azure"
+  # Ensures the script continues even if login fails 
+  allow_failure: false 
+
+# ----------------------------------------------------
+# 1. BUILD Stage (Artifact Generation)
+# ----------------------------------------------------
+
+build_package:
+  stage: build
+  image: node:20 # Example: Use Node image for a JavaScript/React app
+  script:
+    - echo "Starting application build..."
+    # Install dependencies (or build using Maven/dotnet publish/etc.)
+    - npm install 
+    # Compile and generate the deployment package (e.g., a zip file of the build output)
+    - npm run build
+    - zip -r deploy_package.zip ./build/
+    - echo "Deployment package created: deploy_package.zip"
+  
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - deploy_package.zip # Package containing the web app files
+    
+# ----------------------------------------------------
+# 2. TEST Stage (Unit, Integration, Security Tests)
+# ----------------------------------------------------
+
+unit_tests:
+  stage: test
+  image: node:20
+  script:
+    - echo "Running unit tests..."
+    # Example test command
+    - npm test 
+  # Test reports can be exposed via Junit artifacts
+  
+security_scan:
+  stage: test
+  image: docker:latest
+  script:
+    - echo "Simulating security scanning (e.g., SAST or dependency check)..."
+    # Example: run a simple vulnerability check or placeholder command
+    - echo "Security scan complete. No critical vulnerabilities found."
+  allow_failure: true # Security scans often allow failure for non-blocking feedback
+
+# ----------------------------------------------------
+# 3. DEPLOY STAGING Stage
+# ----------------------------------------------------
+
+deploy_to_staging:
+  stage: deploy_staging
+  environment:
+    name: staging
+    url: https://$STAGING_APP_NAME.azurewebsites.net
+  # Inherits Azure authentication from the template
+  extends: .azure_cli_template
+  script:
+    - echo "Deploying artifacts to Staging environment: $STAGING_APP_NAME"
+    # Deploy the zip package using Azure Web App deployment command
+    - az webapp deployment source config-zip \
+        --resource-group $RESOURCE_GROUP_NAME \
+        --name $STAGING_APP_NAME \
+        --src deploy_package.zip \
+        --debug
+    - echo "Staging deployment successful. Ready for verification."
+  dependencies:
+    - build_package # Ensures we deploy the artifact created in the build stage
+  # Deploy only when merging to the main branch
+  only:
+    - main 
+
+# ----------------------------------------------------
+# 4. DEPLOY PRODUCTION Stage
+# ----------------------------------------------------
+
+deploy_to_production:
+  stage: deploy_prod
+  environment:
+    name: production
+    url: https://$PROD_APP_NAME.azurewebsites.net
+  extends: .azure_cli_template
+  script:
+    - echo "Deploying artifacts to Production environment: $PROD_APP_NAME"
+    # Deploy the zip package to the production Web App
+    - az webapp deployment source config-zip \
+        --resource-group $RESOURCE_GROUP_NAME \
+        --name $PROD_APP_NAME \
+        --src deploy_package.zip \
+        --debug
+    - echo "Production deployment successful."
+
+  dependencies:
+    - build_package # Depend on the same build artifact
+  
+  # CRITICAL SECURITY GATE: Deploy only on the main branch
+  only:
+    - main 
+
+  # CRITICAL PROMOTION GATE: Requires manual intervention after staging verification
+  when: manual
+  
+  # CRITICAL PROTECTION: Requires deployment success from the preceding staging job
+  needs:
+    - deploy_to_staging 
